@@ -22,6 +22,8 @@ use crate::quantize::*;
 use crate::rdo::*;
 use crate::stats::EncoderStats;
 use crate::util::*;
+use fast_slic_rust::arrays::Array2D;
+use fast_slic_rust::cluster::Cluster;
 use std::ops::{Index, IndexMut};
 use std::sync::Arc;
 
@@ -61,6 +63,8 @@ pub struct TileStateMut<'a, T: Pixel> {
   pub input_qres: &'a Plane<T>,
   pub deblock: &'a DeblockState,
   pub rec: TileMut<'a, T>,
+  pub superpixels_split_score: &'a Array2D<f32>, // SLIC segmentation processed scores for partitioning
+  pub superpixels_split_score_mean: f32, // SLIC segmentation processed scores for partitioning
   pub qc: QuantizationContext,
   pub segmentation: &'a SegmentationState,
   pub restoration: TileRestorationStateMut<'a>,
@@ -163,6 +167,8 @@ impl<'a, T: Pixel> TileStateMut<'a, T> {
       input_tile: Tile::new(&fs.input, luma_rect),
       input_hres: &fs.input_hres,
       input_qres: &fs.input_qres,
+      superpixels_split_score: &fs.superpixels_split_score, // SLIC segmentation centroids
+      superpixels_split_score_mean: fs.superpixels_split_score_mean, // SLIC segmentation centroids
       deblock: &fs.deblock,
       rec: TileMut::new(Arc::make_mut(&mut fs.rec), luma_rect),
       qc: Default::default(),

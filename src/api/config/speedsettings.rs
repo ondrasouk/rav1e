@@ -87,6 +87,7 @@ impl Default for SpeedSettings {
           BlockSize::BLOCK_4X4,
           BlockSize::BLOCK_64X64,
         ),
+        experimental_pruning: true, // FIXME: before merge set to false
       },
       transform: TransformSpeedSettings {
         reduced_tx_set: false,
@@ -239,6 +240,9 @@ pub struct PartitionSpeedSettings {
   ///
   /// Must be based on square block sizes, so e.g. 8×4 isn't allowed here.
   pub partition_range: PartitionRange,
+
+  /// Allow partition pruning based on SLIC segmentation to provide tile encode hints.
+  pub experimental_pruning: bool,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]

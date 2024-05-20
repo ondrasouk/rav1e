@@ -15,7 +15,7 @@ use itertools::izip;
 
 #[derive(Debug, Default, Clone)]
 pub struct ActivityMask {
-  variances: Box<[u32]>,
+  pub variances: Box<[u32]>,
 }
 
 impl ActivityMask {

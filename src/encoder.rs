@@ -31,6 +31,7 @@ use crate::rate::{
 use crate::rdo::*;
 use crate::segmentation::*;
 use crate::serialize::{Deserialize, Serialize};
+use crate::slic_segmentation::*;
 use crate::stats::EncoderStats;
 use crate::tiling::*;
 use crate::transform::*;
@@ -42,6 +43,7 @@ use arrayvec::*;
 use bitstream_io::{BigEndian, BitWrite, BitWriter};
 use rayon::iter::*;
 
+use fast_slic_rust::arrays::Array2D;
 use std::collections::VecDeque;
 use std::io::Write;
 use std::mem::MaybeUninit;
@@ -412,6 +414,8 @@ pub struct FrameState<T: Pixel> {
   pub input_hres: Arc<Plane<T>>, // half-resolution version of input luma
   pub input_qres: Arc<Plane<T>>, // quarter-resolution version of input luma
   pub rec: Arc<Frame<T>>,
+  pub superpixels_split_score: Arc<Array2D<f32>>, // SLIC segmentation processed scores for partitioning
+  pub superpixels_split_score_mean: f32, // SLIC segmentation processed scores for partitioning
   pub cdfs: CDFContext,
   pub context_update_tile_id: usize, // tile id used for the CDFontext
   pub max_tile_size_bytes: u32,
@@ -448,12 +452,15 @@ impl<T: Pixel> FrameState<T> {
 
     let hres = Plane::new(0, 0, 0, 0, 0, 0);
     let qres = Plane::new(0, 0, 0, 0, 0, 0);
+    let scores = Array2D::from_fill(0f32, 1, 1);
 
     Self {
       sb_size_log2: fi.sb_size_log2(),
       input: frame,
       input_hres: Arc::new(hres),
       input_qres: Arc::new(qres),
+      superpixels_split_score: Arc::new(scores),
+      superpixels_split_score_mean: f32::NAN,
       rec,
       cdfs: CDFContext::new(0),
       context_update_tile_id: 0,
@@ -475,12 +482,15 @@ impl<T: Pixel> FrameState<T> {
 
     let hres = frame.planes[0].downsampled(fi.width, fi.height);
     let qres = hres.downsampled(fi.width, fi.height);
+    let scores = Array2D::from_fill(0f32, 1, 1);
 
     Self {
       sb_size_log2: fi.sb_size_log2(),
       input: frame,
       input_hres: Arc::new(hres),
       input_qres: Arc::new(qres),
+      superpixels_split_score: Arc::new(scores),
+      superpixels_split_score_mean: f32::NAN,
       rec: Arc::new(Frame::new(
         luma_width,
         luma_height,
@@ -2914,6 +2924,7 @@ fn encode_partition_bottomup<T: Pixel, W: Writer>(
   rdo_output
 }
 
+#[profiling::function]
 fn encode_partition_topdown<T: Pixel, W: Writer>(
   fi: &FrameInvariants<T>, ts: &mut TileStateMut<'_, T>,
   cw: &mut ContextWriter, w_pre_cdef: &mut W, w_post_cdef: &mut W,
@@ -3194,6 +3205,251 @@ fn encode_partition_topdown<T: Pixel, W: Writer>(
 
         partitions.iter().for_each(|&offset| {
           encode_partition_topdown(
+            fi,
+            ts,
+            cw,
+            w_pre_cdef,
+            w_post_cdef,
+            subsize,
+            offset,
+            &None,
+            inter_cfg,
+            enc_stats,
+          );
+        });
+      }
+    }
+    _ => unreachable!(),
+  }
+
+  if is_square
+    && bsize >= BlockSize::BLOCK_8X8
+    && (bsize == BlockSize::BLOCK_8X8
+      || partition != PartitionType::PARTITION_SPLIT)
+  {
+    cw.bc.update_partition_context(tile_bo, subsize, bsize);
+  }
+}
+
+/// This is a modified copy of encode_partition_topdown()
+#[profiling::function]
+fn encode_partition_topdown_pruned<T: Pixel, W: Writer>(
+  fi: &FrameInvariants<T>, ts: &mut TileStateMut<'_, T>,
+  cw: &mut ContextWriter, w_pre_cdef: &mut W, w_post_cdef: &mut W,
+  bsize: BlockSize, tile_bo: TileBlockOffset,
+  block_output: &Option<PartitionGroupParameters>, inter_cfg: &InterConfig,
+  enc_stats: &mut EncoderStats,
+) {
+  if tile_bo.0.x >= ts.mi_width || tile_bo.0.y >= ts.mi_height {
+    return;
+  }
+  let is_square = bsize.is_sqr();
+  let rdo_type = RDOType::PixelDistRealRate;
+  let hbs = bsize.width_mi() / 2;
+  let has_cols = tile_bo.0.x + hbs < ts.mi_width;
+  let has_rows = tile_bo.0.y + hbs < ts.mi_height;
+
+  // TODO: Update for 128x128 superblocks
+  debug_assert!(fi.partition_range.max <= BlockSize::BLOCK_64X64);
+
+  let must_split =
+    is_square && (bsize > fi.partition_range.max || !has_cols || !has_rows);
+
+  let can_split = // FIXME: sub-8x8 inter blocks not supported for non-4:2:0 sampling
+      if fi.frame_type.has_inter() &&
+          fi.sequence.chroma_sampling != ChromaSampling::Cs420 &&
+          bsize <= BlockSize::BLOCK_8X8 {
+        false
+      } else {
+        (bsize > fi.partition_range.min && is_square) || must_split
+      };
+
+  let mut rdo_output =
+    block_output.clone().unwrap_or_else(|| PartitionGroupParameters {
+      part_type: PartitionType::PARTITION_INVALID,
+      rd_cost: std::f64::MAX,
+      part_modes: ArrayVec::new(),
+    });
+
+  let mut has_rdo = false;
+
+  let partition = if must_split {
+    PartitionType::PARTITION_SPLIT
+  } else if can_split {
+    debug_assert!(bsize.is_sqr());
+
+    let mut part_type = superpixels_partition_decision(&ts, tile_bo, bsize);
+    if part_type != PartitionType::PARTITION_NONE {
+      let mut part_types: ArrayVec<PartitionType, 2> = ArrayVec::new();
+      if part_type == PartitionType::PARTITION_INVALID {
+        part_types.push(PartitionType::PARTITION_SPLIT);
+        part_types.push(PartitionType::PARTITION_NONE);
+      } else {
+        part_types.push(part_type)
+      };
+      has_rdo = true;
+      // Blocks of sizes within the supported range are subjected to a partitioning decision
+      rdo_output = rdo_partition_decision(
+        fi,
+        ts,
+        cw,
+        w_pre_cdef,
+        w_post_cdef,
+        bsize,
+        tile_bo,
+        &rdo_output,
+        &part_types,
+        rdo_type,
+        inter_cfg,
+      );
+      part_type = rdo_output.part_type;
+      // println!("{:?}", part_type);
+    }
+    part_type
+  } else {
+    // Blocks of sizes below the supported range are encoded directly
+    PartitionType::PARTITION_NONE
+  };
+
+  debug_assert!(partition != PartitionType::PARTITION_INVALID);
+
+  let subsize = bsize.subsize(partition).unwrap();
+
+  if bsize >= BlockSize::BLOCK_8X8 && is_square {
+    let w: &mut W = if cw.bc.cdef_coded { w_post_cdef } else { w_pre_cdef };
+    cw.write_partition(w, tile_bo, partition, bsize);
+  }
+
+  match partition {
+    PartitionType::PARTITION_NONE => {
+      let rdo_decision;
+      let part_decision =
+        if let Some(part_mode) = rdo_output.part_modes.first() {
+          // The optimal prediction mode is known from a previous iteration
+          part_mode
+        } else {
+          // Make a prediction mode decision for blocks encoded with no rdo_partition_decision call (e.g. edges)
+          rdo_decision =
+            rdo_mode_decision(fi, ts, cw, bsize, tile_bo, inter_cfg);
+          &rdo_decision
+        };
+
+      let mode_luma = part_decision.pred_mode_luma;
+      let mode_chroma = part_decision.pred_mode_chroma;
+
+      let cfl = part_decision.pred_cfl_params;
+      let skip = part_decision.skip;
+      let ref_frames = part_decision.ref_frames;
+      let mvs = part_decision.mvs;
+      let mut cdef_coded = cw.bc.cdef_coded;
+
+      // Set correct segmentation ID before encoding and before
+      // rdo_tx_size_type().
+      cw.bc.blocks.set_segmentation_idx(tile_bo, bsize, part_decision.sidx);
+
+      // NOTE: Cannot avoid calling rdo_tx_size_type() here again,
+      // because, with top-down partition RDO, the neighboring contexts
+      // of current partition can change, i.e. neighboring partitions can split down more.
+      let (tx_size, tx_type) = rdo_tx_size_type(
+        fi, ts, cw, bsize, tile_bo, mode_luma, ref_frames, mvs, skip,
+      );
+
+      let mut mv_stack = ArrayVec::<CandidateMV, 9>::new();
+      let is_compound = ref_frames[1] != NONE_FRAME;
+      let mode_context = cw.find_mvrefs(
+        tile_bo,
+        ref_frames,
+        &mut mv_stack,
+        bsize,
+        fi,
+        is_compound,
+      );
+
+      // TODO: proper remap when is_compound is true
+      if !mode_luma.is_intra() {
+        todo!("Pruning is supported for intra-only for now.");
+      }
+
+      // FIXME: every final block that has gone through the RDO decision process is encoded twice
+      cdef_coded = encode_block_pre_cdef(
+        &fi.sequence,
+        ts,
+        cw,
+        if cdef_coded { w_post_cdef } else { w_pre_cdef },
+        bsize,
+        tile_bo,
+        skip,
+      );
+      encode_block_post_cdef(
+        fi,
+        ts,
+        cw,
+        if cdef_coded { w_post_cdef } else { w_pre_cdef },
+        mode_luma,
+        mode_chroma,
+        part_decision.angle_delta,
+        ref_frames,
+        mvs,
+        bsize,
+        tile_bo,
+        skip,
+        cfl,
+        tx_size,
+        tx_type,
+        mode_context,
+        &mv_stack,
+        RDOType::PixelDistRealRate,
+        true,
+        Some(enc_stats),
+      );
+    }
+    PARTITION_SPLIT | PARTITION_HORZ | PARTITION_VERT => {
+      if !rdo_output.part_modes.is_empty() && has_rdo {
+        debug_assert!(can_split && has_rdo);
+
+        // The optimal prediction modes for each split block is known from an rdo_partition_decision() call
+        for mode in rdo_output.part_modes {
+          // Each block is subjected to a new splitting decision
+          encode_partition_topdown_pruned(
+            fi,
+            ts,
+            cw,
+            w_pre_cdef,
+            w_post_cdef,
+            subsize,
+            mode.bo,
+            &Some(PartitionGroupParameters {
+              rd_cost: mode.rd_cost,
+              part_type: PartitionType::PARTITION_NONE,
+              part_modes: [mode][..].try_into().unwrap(),
+            }),
+            inter_cfg,
+            enc_stats,
+          );
+        }
+      } else {
+        debug_assert!(must_split && !has_rdo);
+        let hbsw = subsize.width_mi(); // Half the block size width in blocks
+        let hbsh = subsize.height_mi(); // Half the block size height in blocks
+        let four_partitions = [
+          tile_bo,
+          TileBlockOffset(BlockOffset {
+            x: tile_bo.0.x + hbsw,
+            y: tile_bo.0.y,
+          }),
+          TileBlockOffset(BlockOffset {
+            x: tile_bo.0.x,
+            y: tile_bo.0.y + hbsh,
+          }),
+          TileBlockOffset(BlockOffset {
+            x: tile_bo.0.x + hbsw,
+            y: tile_bo.0.y + hbsh,
+          }),
+        ];
+        let partitions = get_sub_partitions(&four_partitions, partition);
+
+        partitions.iter().for_each(|&offset| {
+          encode_partition_topdown_pruned(
             fi,
             ts,
             cw,
@@ -3524,6 +3780,22 @@ fn encode_tile<'a, T: Pixel>(
           inter_cfg,
           &mut enc_stats,
         );
+      } else if fi.config.speed_settings.partition.experimental_pruning
+        && (fi.frame_type == FrameType::INTRA_ONLY
+          || fi.frame_type == FrameType::KEY)
+      {
+        encode_partition_topdown_pruned(
+          fi,
+          ts,
+          &mut cw,
+          &mut sbs_qe.w_pre_cdef,
+          &mut sbs_qe.w_post_cdef,
+          BlockSize::BLOCK_64X64,
+          tile_bo,
+          &None,
+          inter_cfg,
+          &mut enc_stats,
+        );
       } else {
         encode_partition_topdown(
           fi,
@@ -3772,6 +4044,13 @@ pub fn encode_frame<T: Pixel>(
   let obu_extension = 0;
 
   let mut packet = Vec::new();
+
+  if fi.config.speed_settings.partition.experimental_pruning
+    && (fi.frame_type == FrameType::INTRA_ONLY
+      || fi.frame_type == FrameType::KEY)
+  {
+    slic_segmentation_compute(fi, fs);
+  }
 
   if fi.enable_segmentation {
     fs.segmentation = get_initial_segmentation(fi);

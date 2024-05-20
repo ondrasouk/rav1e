@@ -411,3 +411,5 @@ pub mod bench {
 
 #[cfg(fuzzing)]
 pub mod fuzzing;
+
+mod slic_segmentation;
